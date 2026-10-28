@@ -1,0 +1,434 @@
+#!/usr/bin/env bash
+# lc — terminal runner for the litcode challenges.  Run `lc help`.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROGRESS="$ROOT/.progress"
+PG_URL="${LC_PG_URL:-postgres://lc:lc@localhost:54329/lc}"
+touch "$PROGRESS"
+
+c_dim=$'\033[2m'; c_green=$'\033[32m'; c_red=$'\033[31m'; c_yellow=$'\033[33m'
+c_bold=$'\033[1m'; c_reset=$'\033[0m'
+[[ -t 1 ]] || { c_dim=; c_green=; c_red=; c_yellow=; c_bold=; c_reset=; }
+
+die() { echo "${c_red}lc: $*${c_reset}" >&2; exit 1; }
+
+pager() {
+  if command -v glow >/dev/null && [[ "${1:-}" == *.md ]]; then glow -p "$1"
+  elif command -v bat >/dev/null; then bat --paging=auto --style=plain "$1"
+  else ${PAGER:-less} "$1"; fi
+}
+
+# --- challenge lookup ---------------------------------------------------------
+
+all_dirs() {
+  find "$ROOT/ts" "$ROOT/sys" "$ROOT/sql" "$ROOT/theory" -mindepth 1 -maxdepth 3 -type d \
+    -name '[0-9][0-9][0-9]-*' -not -path '*/node_modules/*' -not -path '*/target/*' \
+    | awk -F/ '{print $NF "\t" $0}' | sort | cut -f2
+}
+
+find_dir() {
+  local q="$1" d
+  if [[ "$q" =~ ^[0-9]+$ ]]; then q="$(printf '%03d' "$((10#$q))")"; fi
+  d="$(all_dirs | awk -F/ -v q="$q" '$NF ~ "^"q"-" || $NF ~ "-"q"$" || $NF == q {print; exit}')"
+  [[ -n "$d" ]] || die "no challenge matching '$1' (try: lc list)"
+  echo "$d"
+}
+
+id_of() { basename "$1" | cut -d- -f1; }
+name_of() { basename "$1" | cut -d- -f2-; }
+rel() { echo "${1#"$ROOT"/}"; }
+
+kind_of() {
+  case "$(rel "$1")" in
+    ts/*) echo ts ;;
+    sys/*) echo sys ;;
+    sql/labs/*) echo lab ;;
+    sql/*) echo sql ;;
+    theory/*) echo theory ;;
+  esac
+}
+
+difficulty_of() {
+  grep -m1 -o 'Difficulty:\*\* [A-Za-z]*' "$1/README.md" 2>/dev/null | awk '{print $2}' || true
+}
+
+# The file you edit for a challenge, per language.
+work_file() {
+  local dir="$1" lang="${2:-}"
+  case "$(kind_of "$dir")" in
+    ts) echo "$dir/solution.ts" ;;
+    sql) echo "$dir/answer.sql" ;;
+    lab|theory) echo "$dir/README.md" ;;
+    sys)
+      if [[ "$lang" == rust ]]; then echo "$dir/rust/src/lib.rs"
+      else find "$dir/c" -maxdepth 1 -name '*.c' ! -name test.c | head -1; fi ;;
+  esac
+}
+
+solution_file() {
+  local wf; wf="$(work_file "$1" "${2:-}")"
+  local dir="$1"
+  case "$(kind_of "$dir")" in
+    lab|theory) echo "$ROOT/solutions/$(rel "$dir")/ANSWERS.md" ;;
+    *) echo "$ROOT/solutions/$(rel "$wf")" ;;
+  esac
+}
+
+# --- progress -----------------------------------------------------------------
+
+mark() { grep -qx "$1:$2" "$PROGRESS" || echo "$1:$2" >>"$PROGRESS"; }
+is_done() { grep -qx "$1:$2" "$PROGRESS"; }
+
+status_of() {
+  local dir="$1" id kind; id="$(id_of "$dir")"; kind="$(kind_of "$dir")"
+  tick() { if is_done "$id" "$1"; then printf '%s' "${c_green}$2✓${c_reset}"; else printf '%s' "${c_dim}$2·${c_reset}"; fi; }
+  case "$kind" in
+    sys) tick c "C"; printf ' '; tick rust "R" ;;
+    ts) tick ts "" ;;
+    sql) tick sql "" ;;
+    *) tick done "" ;;
+  esac
+}
+
+fully_done() {
+  local id; id="$(id_of "$1")"
+  case "$(kind_of "$1")" in
+    sys) is_done "$id" c && is_done "$id" rust ;;
+    ts) is_done "$id" ts ;;
+    sql) is_done "$id" sql ;;
+    *) is_done "$id" done ;;
+  esac
+}
+
+# --- commands -----------------------------------------------------------------
+
+cmd_list() {
+  local filter="${1:-}" track="" dir kind
+  while read -r dir; do
+    kind="$(kind_of "$dir")"
+    [[ -z "$filter" || "$kind" == "$filter" || "$(rel "$dir")" == *"$filter"* ]] || continue
+    local t; t="$(rel "$(dirname "$dir")")"
+    if [[ "$t" != "$track" ]]; then
+      track="$t"; printf '\n%s%s%s\n' "$c_bold" "$track" "$c_reset"
+    fi
+    local diff; diff="$(difficulty_of "$dir")"
+    local dc="$c_dim"
+    case "$diff" in Easy) dc="$c_green" ;; Medium) dc="$c_yellow" ;; Hard) dc="$c_red" ;; esac
+    printf '  %s  %-36s %s%-7s%s %s\n' "$(id_of "$dir")" "$(name_of "$dir")" "$dc" "$diff" "$c_reset" "$(status_of "$dir")"
+  done < <(all_dirs)
+  echo
+}
+
+cmd_show() { pager "$(find_dir "$1")/README.md"; }
+
+cmd_path() {
+  local dir; dir="$(find_dir "$1")"
+  work_file "$dir" "${2:-}"
+}
+
+cmd_open() {
+  local dir; dir="$(find_dir "$1")"
+  local wf; wf="$(work_file "$dir" "${2:-}")"
+  cd "$dir"
+  if [[ "$wf" == "$dir/README.md" ]]; then exec "${EDITOR:-nvim}" README.md; fi
+  exec "${EDITOR:-nvim}" -O "${wf#"$dir"/}" README.md
+}
+
+# lc tmux <id> [lang]: new tmux window = editor (code | README) on top, watcher below.
+cmd_tmux() {
+  [[ -n "${TMUX:-}" ]] || die "not inside tmux"
+  local dir; dir="$(find_dir "$1")"
+  local id; id="$(id_of "$dir")"
+  local lang="${2:-}"
+  tmux new-window -n "lc-$id${lang:+-$lang}" -c "$dir" "$ROOT/lc open $id $lang"
+  case "$(kind_of "$dir")" in
+    lab) tmux split-window -h -c "$dir" "psql '$PG_URL'"
+         tmux split-window -v -c "$dir" "psql '$PG_URL'" ;;
+    theory) ;;
+    *) tmux split-window -v -l 35% -c "$dir" "$ROOT/lc watch $id $lang" ;;
+  esac
+  tmux select-pane -t '{top-left}'
+}
+
+run_tests() {
+  local dir="$1" lang="$2" id; id="$(id_of "$dir")"
+  case "$lang" in
+    ts)
+      (cd "$dir" && bun test ./solution.test.ts) ;;
+    c)
+      make -s -C "$dir/c" test ;;
+    rust)
+      local pkg; pkg="$(awk -F'"' '/^name *=/{print $2; exit}' "$dir/rust/Cargo.toml")"
+      # run from inside the repo so .cargo/config.toml (linker fix) is picked up
+      (cd "$ROOT/sys" && cargo test -q -p "$pkg") ;;
+    sql)
+      sql_check "$dir" ;;
+  esac
+}
+
+cmd_test() {
+  local dir; dir="$(find_dir "$1")"
+  local id; id="$(id_of "$dir")"
+  local kind; kind="$(kind_of "$dir")"
+  local langs=()
+  case "$kind" in
+    ts) langs=(ts) ;;
+    sql) langs=(sql) ;;
+    sys) if [[ -n "${2:-}" ]]; then langs=("$2"); else langs=(c rust); fi ;;
+    *) die "$(name_of "$dir") is read-and-do; mark it with: lc done $id" ;;
+  esac
+  local failed=0
+  for lang in "${langs[@]}"; do
+    printf '%s── %s %s [%s] ──%s\n' "$c_bold" "$id" "$(name_of "$dir")" "$lang" "$c_reset"
+    if run_tests "$dir" "$lang"; then
+      mark "$id" "$lang"
+      printf '%s✓ %s passed%s\n\n' "$c_green" "$lang" "$c_reset"
+    else
+      failed=1
+      printf '%s✗ %s failed%s\n\n' "$c_red" "$lang" "$c_reset"
+    fi
+  done
+  return $failed
+}
+
+cmd_watch() {
+  local dir; dir="$(find_dir "$1")"
+  command -v watchexec >/dev/null || die "watchexec not found"
+  exec watchexec -c -q -w "$dir" -i '**/build/**' -i '**/target/**' -e ts,c,h,rs,sql \
+    -- "$ROOT/lc" test "$(id_of "$dir")" ${2:-}
+}
+
+cmd_hint() {
+  local dir; dir="$(find_dir "$1")"
+  local n="${2:-1}"
+  [[ -f "$dir/hints.md" ]] || die "no hints for this one"
+  local total; total="$(awk '/^---$/{c++} END{print c+1}' "$dir/hints.md")"
+  ((n >= 1 && n <= total)) || die "hint $n does not exist (1..$total)"
+  printf '%sHint %d/%d%s\n\n' "$c_bold" "$n" "$total" "$c_reset"
+  awk -v n="$n" 'BEGIN{c=1} /^---$/{c++; next} c==n' "$dir/hints.md"
+  ((n < total)) && printf '\n%s(next: lc hint %s %d)%s\n' "$c_dim" "$(id_of "$dir")" "$((n + 1))" "$c_reset"
+  return 0
+}
+
+confirm() {
+  local reply
+  read -r -p "$1 [y/N] " reply
+  [[ "$reply" == y || "$reply" == Y ]]
+}
+
+cmd_solution() {
+  local dir; dir="$(find_dir "$1")"
+  local lang="${2:-}"
+  [[ "$(kind_of "$dir")" == sys && -z "$lang" ]] && lang=c
+  local f; f="$(solution_file "$dir" "$lang")"
+  [[ -f "$f" ]] || die "no reference solution at $(rel "$f")"
+  confirm "Show the reference solution for $(name_of "$dir") [$lang]? Struggle a bit more first?" || exit 0
+  pager "$f"
+}
+
+cmd_reset() {
+  local dir; dir="$(find_dir "$1")"
+  local wf; wf="$(work_file "$dir" "${2:-}")"
+  confirm "Restore $(rel "$wf") to the original stub (your code is lost)?" || exit 0
+  git -C "$ROOT" checkout -- "$(rel "$wf")" || die "reset needs the stubs committed in git"
+  echo "restored $(rel "$wf")"
+}
+
+cmd_done() {
+  local dir; dir="$(find_dir "$1")"
+  mark "$(id_of "$dir")" done
+  echo "marked $(name_of "$dir") as done"
+}
+
+cmd_next() {
+  local filter="${1:-}" dir
+  while read -r dir; do
+    [[ -z "$filter" || "$(kind_of "$dir")" == "$filter" ]] || continue
+    if ! fully_done "$dir"; then
+      printf '%s%s %s%s  (%s)\n' "$c_bold" "$(id_of "$dir")" "$(name_of "$dir")" "$c_reset" "$(rel "$dir")"
+      return
+    fi
+  done < <(all_dirs)
+  echo "everything done. go touch grass."
+}
+
+cmd_progress() {
+  local kind dir total done_n
+  for kind in ts sys sql lab theory; do
+    total=0; done_n=0
+    while read -r dir; do
+      [[ "$(kind_of "$dir")" == "$kind" ]] || continue
+      total=$((total + 1))
+      fully_done "$dir" && done_n=$((done_n + 1))
+    done < <(all_dirs)
+    ((total)) || continue
+    local width=30 filled=$((done_n * 30 / total))
+    printf '  %-7s [%s%s%s%s] %d/%d\n' "$kind" "$c_green" "$(printf '%*s' "$filled" '' | tr ' ' '#')" "$c_reset" \
+      "$(printf '%*s' "$((width - filled))" '' | tr ' ' '.')" "$done_n" "$total"
+  done
+}
+
+# --- SQL ----------------------------------------------------------------------
+
+psql_q() { psql "$PG_URL" -X -q -v ON_ERROR_STOP=1 "$@"; }
+
+sql_check() {
+  local dir="$1" mine theirs
+  local sol; sol="$ROOT/solutions/$(rel "$dir")/answer.sql"
+  if ! grep -qv '^\s*\(--.*\)\?$' "$dir/answer.sql"; then
+    echo "answer.sql is still empty"; return 1
+  fi
+  # read-only + timeout: answers are single SELECTs and can't modify the shared data
+  local opts="-c default_transaction_read_only=on -c statement_timeout=120s"
+  mine="$(PGOPTIONS="$opts" psql_q -A -F '|' -P footer=off -f "$dir/answer.sql" 2>&1)" || { echo "$mine"; return 1; }
+  theirs="$(PGOPTIONS="$opts" psql_q -A -F '|' -P footer=off -f "$sol" 2>&1)" || { echo "reference failed: $theirs"; return 1; }
+  if [[ "$mine" == "$theirs" ]]; then
+    echo "$mine" | head -15
+    local n; n="$(echo "$mine" | wc -l | tr -d ' ')"
+    ((n > 15)) && echo "${c_dim}... ($n lines)${c_reset}"
+    return 0
+  fi
+  echo "${c_red}output differs from the expected result${c_reset} (< yours, > expected; first 40 lines):"
+  diff <(echo "$mine") <(echo "$theirs") | head -40 || true
+  return 1
+}
+
+cmd_sql() {
+  local sub="${1:-help}"; shift || true
+  case "$sub" in
+    up)
+      (cd "$ROOT/sql" && docker compose up -d)
+      echo "waiting for postgres..."
+      until psql_q -c 'select 1' >/dev/null 2>&1; do sleep 1; done
+      if ! psql_q -tAc "select to_regclass('public.orders')" | grep -q orders; then cmd_sql seed; fi
+      echo "${c_green}ready:${c_reset} $PG_URL" ;;
+    seed)
+      echo "creating schema + seeding (a few million rows, takes ~1 min)..."
+      psql_q -f "$ROOT/sql/schema/01-schema.sql"
+      psql_q -f "$ROOT/sql/schema/02-seed.sql"
+      echo "${c_green}seeded${c_reset}" ;;
+    down) (cd "$ROOT/sql" && docker compose down) ;;
+    nuke) confirm "Delete the database volume?" && (cd "$ROOT/sql" && docker compose down -v) ;;
+    psql) exec psql "$PG_URL" "$@" ;;
+    run)
+      local dir; dir="$(find_dir "$1")"
+      psql_q -f "$dir/answer.sql" ;;
+    explain)
+      local dir; dir="$(find_dir "$1")"
+      { printf 'EXPLAIN (ANALYZE, BUFFERS, VERBOSE off)\n'; grep -v '^\s*--' "$dir/answer.sql"; } | psql_q ;;
+    url) echo "$PG_URL" ;;
+    *) cat <<EOF
+lc sql up              start postgres in docker (port 54329) and seed it
+lc sql seed            (re)create schema and data
+lc sql psql            open psql
+lc sql run <id>        run your answer.sql and print the result
+lc sql explain <id>    EXPLAIN ANALYZE your answer.sql
+lc sql down | nuke     stop container | delete the volume too
+Using: $PG_URL   (override with LC_PG_URL)
+EOF
+    esac
+}
+
+# --- docker toolbox (Linux: LeakSanitizer + valgrind) -------------------------
+
+BOX_IMAGE=litcode-box
+
+cmd_box() {
+  command -v docker >/dev/null || die "docker not found"
+  docker info >/dev/null 2>&1 || die "docker daemon not running (start OrbStack / Docker Desktop)"
+  if [[ "${1:-}" == build ]] || ! docker image inspect "$BOX_IMAGE" >/dev/null 2>&1; then
+    docker build -t "$BOX_IMAGE" "$ROOT/docker"
+    [[ "${1:-}" == build ]] && return
+  fi
+  local tty=(); [[ -t 0 && -t 1 ]] && tty=(-it)
+  local args=(--rm "${tty[@]}" -v "$ROOT:/work"
+    -e LC_PG_URL="${LC_PG_URL:-postgres://lc:lc@host.docker.internal:54329/lc}"
+    --add-host=host.docker.internal:host-gateway)
+  if [[ "${1:-}" == shell ]]; then
+    exec docker run "${args[@]}" --entrypoint bash "$BOX_IMAGE"
+  fi
+  exec docker run "${args[@]}" "$BOX_IMAGE" "$@"
+}
+
+cmd_valgrind() {
+  local dir; dir="$(find_dir "$1")"
+  [[ "$(kind_of "$dir")" == sys ]] || die "valgrind is for the C challenges (1xx)"
+  command -v valgrind >/dev/null || die "valgrind not available here — try: lc box valgrind $1"
+  make -s -C "$dir/c" valgrind
+}
+
+# --- dev: verify that reference solutions pass every test ---------------------
+
+cmd_verify() {
+  local tmp; tmp="$(mktemp -d)"
+  trap "rm -rf '$tmp'" EXIT
+  echo "copying repo to $tmp and applying reference solutions..."
+  rsync -a --exclude .git --exclude target --exclude build --exclude solutions "$ROOT/" "$tmp/"
+  rsync -a --exclude theory --exclude 'sql' "$ROOT/solutions/" "$tmp/"
+  local fail=0
+  echo "${c_bold}== TypeScript${c_reset}"
+  (cd "$tmp/ts" && bun test 2>&1 | tail -5) || fail=1
+  echo "${c_bold}== C${c_reset}"
+  local d
+  for d in "$tmp"/sys/[0-9]*/c; do
+    if make -s -C "$d" test >"$tmp/c.log" 2>&1; then echo "  ok   $(basename "$(dirname "$d")")"
+    else fail=1; echo "  FAIL $(basename "$(dirname "$d")")"; tail -20 "$tmp/c.log"; fi
+  done
+  echo "${c_bold}== Rust${c_reset}"
+  CARGO_TARGET_DIR="$ROOT/sys/target" cargo test -q --manifest-path "$tmp/sys/Cargo.toml" --workspace 2>&1 \
+    | grep -E 'test result|FAILED|panicked|error' || true
+  CARGO_TARGET_DIR="$ROOT/sys/target" cargo test -q --manifest-path "$tmp/sys/Cargo.toml" --workspace >/dev/null 2>&1 || fail=1
+  ((fail == 0)) && echo "${c_green}all reference solutions pass${c_reset}" || echo "${c_red}some reference solutions fail${c_reset}"
+  return $fail
+}
+
+cmd_help() {
+  cat <<EOF
+${c_bold}lc${c_reset} — local leetcode/brilliant for the terminal
+
+  lc list [ts|sys|sql|lab|theory]   all challenges with status
+  lc next [kind]                    first unfinished challenge
+  lc progress                       progress bars
+  lc show <id>                      read the task
+  lc open <id> [c|rust]             \$EDITOR with your file | README
+  lc tmux <id> [c|rust]             new tmux window: editor + test watcher
+  lc test <id> [c|rust]             run tests (sys: both languages by default)
+  lc watch <id> [c|rust]            re-run tests on every save
+  lc hint <id> [n]                  progressive hints
+  lc solution <id> [c|rust]         reference solution (asks first)
+  lc reset <id> [c|rust]            restore the stub from git
+  lc done <id>                      mark a lab/quiz as done
+  lc path <id> [c|rust]             print the file you edit
+  lc sql ...                        postgres helpers (lc sql help)
+  lc valgrind <id>                  C tests under valgrind (Linux)
+  lc box <lc command...>            run inside the Linux docker toolbox
+                                    (lc box build | lc box shell | lc box test 103 c)
+  lc verify                         check every reference solution passes
+
+  <id> is the number (7, 007) or the name (two-sum).
+EOF
+}
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  list|ls) cmd_list "$@" ;;
+  show|cat) cmd_show "$@" ;;
+  open|edit) cmd_open "$@" ;;
+  tmux) cmd_tmux "$@" ;;
+  test|t) cmd_test "$@" ;;
+  watch|w) cmd_watch "$@" ;;
+  hint) cmd_hint "$@" ;;
+  solution|sol) cmd_solution "$@" ;;
+  reset) cmd_reset "$@" ;;
+  done) cmd_done "$@" ;;
+  next) cmd_next "$@" ;;
+  progress|p) cmd_progress ;;
+  path) cmd_path "$@" ;;
+  sql) cmd_sql "$@" ;;
+  box) cmd_box "$@" ;;
+  valgrind|vg) cmd_valgrind "$@" ;;
+  verify) cmd_verify ;;
+  help|-h|--help) cmd_help ;;
+  *) die "unknown command '$cmd' (lc help)" ;;
+esac

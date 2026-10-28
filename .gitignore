@@ -1,0 +1,8 @@
+.progress
+node_modules/
+target/
+build/
+*.dSYM/
+.DS_Store
+.box/
+.direnv/

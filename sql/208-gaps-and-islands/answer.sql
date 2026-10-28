@@ -1,0 +1,2 @@
+-- 208 · Gaps And Islands   (task: lc show 208)
+-- Write your query below.

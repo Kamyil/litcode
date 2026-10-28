@@ -1,0 +1,2 @@
+-- 212 · Lateral Latest Per Customer   (task: lc show 212)
+-- Write your query below.

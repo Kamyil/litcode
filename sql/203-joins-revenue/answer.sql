@@ -1,0 +1,2 @@
+-- 203 · Joins Revenue   (task: lc show 203)
+-- Write your query below.

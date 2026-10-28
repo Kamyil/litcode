@@ -1,0 +1,9 @@
+# On macOS, link with Apple's clang. If `cc` on PATH is a non-Apple gcc (e.g. from nix),
+# rustc links the wrong unwinder and every panic aborts with
+# "fatal runtime error: failed to initiate panic, error 5" — which breaks #[should_panic]
+# and makes failing tests crash the whole test binary.
+[target.aarch64-apple-darwin]
+linker = "/usr/bin/clang"
+
+[target.x86_64-apple-darwin]
+linker = "/usr/bin/clang"

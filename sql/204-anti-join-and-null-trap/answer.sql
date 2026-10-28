@@ -1,0 +1,2 @@
+-- 204 · Anti Join And Null Trap   (task: lc show 204)
+-- Write your query below.
